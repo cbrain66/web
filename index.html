@@ -1,11 +1,242 @@
 <!DOCTYPE html>
-<html lang="en">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Document</title>
+    <title>ICS 檔案匯入 Google 日曆</title>
 </head>
 <body>
-    <h1>Hello World</h1>
+    <h1>ICS 檔案匯入 Google 日曆</h1>
+
+    <input type="file" id="icsFile" accept=".ics"><br><br>
+    <button onclick="importIcs()">匯入到 Google 日曆</button>
+
+    <div id="status"></div>
+
+    <script>
+        // ** 重要：請替換成你自己的 Google API 憑證 **
+        const CLIENT_ID = '378812607252-pmumnmc6vhgk1agagqt298s64a1haj44.apps.googleusercontent.com'; //  你的 OAuth 2.0 Client ID
+        const API_KEY = 'AIzaSyDcPQOHJ7epm_6BNFRhtsiRXd_fNlVBgA8';       //  你的 Google Calendar API 金鑰
+        const DISCOVERY_DOCS = ["https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"];
+        const SCOPES = 'https://www.googleapis.com/auth/calendar';
+
+        let tokenClient;
+        let gapiInited = false;
+        let gisInited = false;
+        let icsDataToUpload; // 儲存 .ics 檔案內容，以便在授權後上傳
+
+        document.getElementById('status').innerText = '正在載入 Google API...';
+
+        /**
+         * 在 Google API 用戶端程式庫載入後立即呼叫。
+         */
+        async function gapiLoaded() {
+            gapi.load('client', initializeGapiClient);
+        }
+
+        /**
+         * 在 Google Identity Services 用戶端程式庫載入後立即呼叫。
+         */
+        async function gisLoaded() {
+            tokenClient = google.accounts.oauth2.initTokenClient({
+                client_id: CLIENT_ID,
+                scope: SCOPES,
+                callback: '', //  藉由呼叫 'handleAuthResult' 處理在彈出視窗中的回應。
+            });
+            gisInited = true;
+            maybeEnableImportButton();
+        }
+
+        /**
+         * 初始化 Google API 用戶端程式庫並設定用戶端金鑰和探索文件。
+         */
+        async function initializeGapiClient() {
+            await gapi.client.init({
+                apiKey: API_KEY,
+                discoveryDocs: DISCOVERY_DOCS,
+            });
+            gapiInited = true;
+            maybeEnableImportButton();
+        }
+
+        /**
+         * 檢查 gapiInited 和 gisInited 是否為 true，然後啟用匯入按鈕。
+         */
+        function maybeEnableImportButton() {
+            if (gapiInited && gisInited) {
+                document.getElementById('status').innerText = 'Google API 載入完成。';
+            }
+        }
+
+
+        function importIcs() {
+            const fileInput = document.getElementById('icsFile');
+            const statusDiv = document.getElementById('status');
+            const file = fileInput.files[0];
+
+            if (!file) {
+                statusDiv.innerText = '請先選擇 .ics 檔案。';
+                return;
+            }
+
+            if (file.type !== 'text/calendar') {
+                statusDiv.innerText = '選擇的檔案不是 .ics 檔案。';
+                return;
+            }
+
+            const reader = new FileReader();
+
+            reader.onload = function(event) {
+                icsDataToUpload = event.target.result; // 儲存 .ics 內容
+                statusDiv.innerText = '正在處理 .ics 檔案...';
+                requestAccess(); // 請求 Google Calendar 存取權限
+            };
+
+            reader.onerror = function(event) {
+                statusDiv.innerText = '讀取檔案時發生錯誤。';
+            };
+
+            reader.readAsText(file);
+        }
+
+
+        /**
+         * 立即請求授權視窗。
+         * @param {Event} event 觸發按鈕點擊事件。
+         */
+        function requestAccess() {
+            tokenClient.callback = async (resp) => {
+                if (resp.error !== undefined) {
+                    throw (resp);
+                }
+                document.getElementById('status').innerText = '已取得 Google Calendar 存取權限，正在匯入事件...';
+                await uploadToCalendar();
+            };
+
+            if (gapi.client.getToken() === null) {
+                //  首次授權流程
+                tokenClient.requestAccessToken();
+            } else {
+                //  已授權過，直接上傳
+                tokenClient.callback( {'access_token': gapi.client.getToken().access_token} );
+            }
+        }
+
+
+        /**
+         * 解析 ICS 檔案並將事件新增到 Google 日曆。
+         */
+        async function uploadToCalendar() {
+            const statusDiv = document.getElementById('status');
+
+            try {
+                const events = parseICS(icsDataToUpload); // 解析 ICS 檔案取得事件陣列
+                statusDiv.innerText = `解析到 ${events.length} 個事件，正在新增到 Google 日曆...`;
+
+                for (const event of events) {
+                    await insertEvent(event); // 逐個新增事件到 Google 日曆
+                }
+
+                statusDiv.innerText = '事件已成功匯入到 Google 日曆！';
+
+            } catch (error) {
+                console.error("匯入事件時發生錯誤:", error);
+                statusDiv.innerText = '匯入事件時發生錯誤，請查看控制台錯誤訊息。';
+            }
+        }
+
+
+        /**
+         * 解析 ICS 檔案內容，回傳事件物件陣列。
+         * @param {string} icsData ICS 檔案內容。
+         * @return {Array<object>} 事件物件陣列。
+         */
+        function parseICS(icsData) {
+            const events = [];
+            const eventBlocks = icsData.split('BEGIN:VEVENT').slice(1); // 移除第一個元素 (BEGIN:VCALENDAR 前的內容)
+
+            for (const eventBlock of eventBlocks) {
+                const event = {};
+                const lines = eventBlock.split('\n');
+
+                for (const line of lines) {
+                    if (line.startsWith('SUMMARY:')) {
+                        event.summary = line.substring(8).trim();
+                    } else if (line.startsWith('DTSTART:')) {
+                        event.start = parseICSDate(line.substring(8).trim());
+                    } else if (line.startsWith('DTEND:')) {
+                        event.end = parseICSDate(line.substring(6).trim());
+                    } else if (line.startsWith('DESCRIPTION:')) {
+                        event.description = line.substring(12).trim();
+                    } else if (line.startsWith('LOCATION:')) {
+                        event.location = line.substring(9).trim();
+                    }
+                    //  可以根據需要解析更多 ICS 屬性 (例如: 時區、提醒、參與者等)
+                }
+                if(event.summary){ // 確保有 summary 的事件才加入，避免解析到不完整的事件區塊
+                    events.push(event);
+                }
+
+            }
+            return events;
+        }
+
+
+        /**
+         * 解析 ICS 日期字串 (YYYYMMDDTHHMMSSZ 或 YYYYMMDDTHHMMSS) 成為 Google Calendar API 可接受的日期物件格式。
+         * @param {string} dateStr ICS 日期字串。
+         * @return {object} Google Calendar API 日期物件。
+         */
+        function parseICSDate(dateStr) {
+            let year = dateStr.substring(0, 4);
+            let month = dateStr.substring(4, 6);
+            let day = dateStr.substring(6, 8);
+            let hour = dateStr.substring(9, 11); //  跳過 'T' 字元
+            let minute = dateStr.substring(11, 13);
+            let second = dateStr.substring(13, 15);
+            let dateTime = `${year}-${month}-${day}T${hour}:${minute}:${second}+08:00`; //  預設時區為 +08:00，請根據實際情況調整
+
+             //  簡易判斷是否包含時間，若沒有時間資訊，則設定為日期物件 (dateOnly)
+            if(dateStr.length === 8){
+                return {
+                    date: `${year}-${month}-${day}`
+                };
+            } else {
+                return {
+                    dateTime: dateTime,
+                    timeZone: 'Asia/Taipei' //  預設時區為 台灣 (+08:00)
+                };
+            }
+        }
+
+
+        /**
+         * 將單個事件插入 Google 日曆。
+         * @param {object} event 事件物件 (包含 summary, start, end 等屬性)。
+         */
+        async function insertEvent(event) {
+            try {
+                await gapi.client.calendar.events.insert({
+                    calendarId: 'primary', //  匯入到主要日曆，可以替換成其他日曆 ID
+                    resource: event
+                });
+                console.log('成功新增事件:', event.summary); //  除錯訊息，可移除
+            } catch (err) {
+                console.error("新增事件失敗", err)
+                throw err; //  往上拋出錯誤，讓 uploadToCalendar 函式可以捕捉
+            }
+        }
+
+
+        //  載入 Google API 程式庫
+        function loadGapi() {
+            gapiLoaded(); //  直接呼叫 gapiLoaded，因為使用了 `<script async defer src="https://apis.google.com/js/api.js" onload="gapiLoaded()">` 和 `gapiLoaded()`
+            gisLoaded();  //  直接呼叫 gisLoaded，因為使用了 `<script async defer src="https://accounts.google.com/gsi/client" onload="gisLoaded()">` 和 `gisLoaded()`
+        }
+        loadGapi(); // 網頁載入時立即載入 Google API
+    </script>
+
+
+     <script async defer src="https://apis.google.com/js/api.js" onload="gapiLoaded()"></script>
+     <script async defer src="https://accounts.google.com/gsi/client" onload="gisLoaded()"></script>
+
 </body>
 </html>
